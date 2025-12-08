@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+jinja2
+python-multipart
+pdfminer.six
+python-docx
+pdfminer.six
+PyPDF2
+striprtf
