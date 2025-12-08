@@ -7,3 +7,6 @@ python-docx
 pdfminer.six
 PyPDF2
 striprtf
+pdf2image
+pytesseract
+Pillow

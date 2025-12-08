@@ -18,6 +18,16 @@ except Exception:
     PdfReader = None  # type: ignore
 
 try:
+    from pdf2image import convert_from_bytes  # type: ignore
+except Exception:
+    convert_from_bytes = None  # type: ignore
+
+try:
+    import pytesseract  # type: ignore
+except Exception:
+    pytesseract = None  # type: ignore
+
+try:
     from pdfminer.high_level import extract_text as pdfminer_extract_text  # type: ignore
 except Exception:
     pdfminer_extract_text = None  # type: ignore
@@ -57,23 +67,44 @@ def _is_doc_ole(b: bytes) -> bool:
 def _read_docx(b: bytes) -> str:
     if Document is None:
         raise RuntimeError("python-docx не установлен. Добавь 'python-docx' в requirements.txt")
-    f = io.BytesIO(b)
-    doc = Document(f)
-    lines = []
-    for p in doc.paragraphs:
-        txt = (p.text or "").strip()
-        if txt:
-            lines.append(txt)
-    for table in getattr(doc, "tables", []):
-        for row in table.rows:
-            cells = []
-            for cell in row.cells:
-                val = (cell.text or "").strip()
-                if val:
-                    cells.append(val)
-            if cells:
-                lines.append(" | ".join(cells))
-    return "\n".join(lines)
+    try:
+        f = io.BytesIO(b)
+        doc = Document(f)
+        lines = []
+        for p in doc.paragraphs:
+            txt = (p.text or "").strip()
+            if txt:
+                lines.append(txt)
+        for table in getattr(doc, "tables", []):
+            for row in table.rows:
+                cells = []
+                for cell in row.cells:
+                    val = (cell.text or "").strip()
+                    if val:
+                        cells.append(val)
+                if cells:
+                    lines.append(" | ".join(cells))
+        if lines:
+            return "\n".join(lines)
+    except Exception:
+        pass
+
+    # Фоллбек: выдёргиваем текст из XML (без стилей)
+    import zipfile
+    import xml.etree.ElementTree as ET
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(b)) as zf:
+            with zf.open("word/document.xml") as docxml:
+                xml_bytes = docxml.read()
+        root = ET.fromstring(xml_bytes)
+        texts = []
+        for t in root.iter():
+            if t.text and t.text.strip():
+                texts.append(t.text.strip())
+        return "\n".join(texts)
+    except Exception:
+        return ""
 
 
 def _read_pdf_with_pypdf2(b: bytes) -> str:
@@ -113,8 +144,22 @@ def _read_pdf(b: bytes) -> str:
                 return txt
         except Exception:
             pass
-    # Вернём подсказку: возможно, это скан (нужен OCR)
-    raise RuntimeError("Не удалось извлечь текст из PDF (возможно, это скан без текста).")
+    # OCR для сканированных PDF
+    ocr_lang = os.getenv("OCR_LANG", "rus+eng")
+    if convert_from_bytes is not None and pytesseract is not None:
+        try:
+            images = convert_from_bytes(b)
+            pages = []
+            for img in images:
+                txt = pytesseract.image_to_string(img, lang=ocr_lang)  # type: ignore
+                if txt:
+                    pages.append(txt)
+            if pages:
+                return "\n".join(pages).strip()
+        except Exception:
+            pass
+    # Вернём подсказку: возможно, это скан без OCR-инструментов
+    raise RuntimeError("Не удалось извлечь текст из PDF (возможно, это скан без текста). Установите tesseract-ocr и зависимости для OCR.")
 
 
 def _read_rtf(b: bytes) -> str:
@@ -128,33 +173,48 @@ def _read_rtf(b: bytes) -> str:
 
 def _read_doc_with_antiword(tmp_path: str) -> str:
     # -w 0 => без переноса строк; -m UTF-8 => кодировка вывода
-    proc = subprocess.run(
-        ["antiword", "-w", "0", "-m", "UTF-8", tmp_path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if proc.returncode == 0:
-        return proc.stdout.decode("utf-8", errors="ignore").strip()
+    try:
+        proc = subprocess.run(
+            ["antiword", "-w", "0", "-m", "UTF-8", tmp_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=15,
+        )
+        if proc.returncode == 0:
+            return proc.stdout.decode("utf-8", errors="ignore").strip()
+    except subprocess.TimeoutExpired:
+        return ""
+    except FileNotFoundError:
+        return ""
+    except Exception:
+        return ""
     return ""
 
 
 def _read_doc_with_catdoc(tmp_path: str) -> str:
     # catdoc по умолчанию в CP1251/KOI8, попросим UTF-8, если поддерживается
-    proc = subprocess.run(
-        ["catdoc", "-d", "utf-8", tmp_path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if proc.returncode == 0 and proc.stdout:
-        try:
-            return proc.stdout.decode("utf-8", errors="ignore").strip()
-        except Exception:
-            pass
-    # fallback: как есть
-    if proc.stdout:
-        return proc.stdout.decode("latin-1", errors="ignore").strip()
+    try:
+        proc = subprocess.run(
+            ["catdoc", "-d", "utf-8", tmp_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=15,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            try:
+                return proc.stdout.decode("utf-8", errors="ignore").strip()
+            except Exception:
+                pass
+        if proc.stdout:
+            return proc.stdout.decode("latin-1", errors="ignore").strip()
+    except subprocess.TimeoutExpired:
+        return ""
+    except FileNotFoundError:
+        return ""
+    except Exception:
+        return ""
     return ""
 
 

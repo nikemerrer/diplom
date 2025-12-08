@@ -104,14 +104,22 @@ async def upload_via_root(request: Request, file: UploadFile = File(...)):
 
         # --- 1) Генерим 1С-JSON ---
         if _to_onec_fn:
-            onec_json = _to_onec_fn(text)
+            onec_result = _to_onec_fn(text)
+            if isinstance(onec_result, dict) and "data" in onec_result:
+                onec_json = onec_result.get("data", {})
+                debug_raw = onec_result.get("_debug_raw")
+            else:
+                onec_json = onec_result
+                debug_raw = None
         elif _extract_fn:
             base = _extract_fn(text)
             # локальный fallback: простое отображение
             from utils.entity_extractor import _to_onec_schema  # type: ignore
             onec_json = _to_onec_schema(text, base)  # type: ignore
+            debug_raw = None
         else:
             onec_json = {}
+            debug_raw = None
 
         pretty = json.dumps(onec_json, ensure_ascii=False, indent=2)
         preview_chars = int(os.getenv("PREVIEW_CHARS", "6000"))
@@ -123,6 +131,7 @@ async def upload_via_root(request: Request, file: UploadFile = File(...)):
             "data": onec_json,     # <<< именно 1С-ориентированный JSON
             "filename": file.filename,
             "length": len(text),
+            "debug_raw": debug_raw,
         }
 
         global LAST_JSON_RESULT
@@ -131,7 +140,7 @@ async def upload_via_root(request: Request, file: UploadFile = File(...)):
         if templates:
             return templates.TemplateResponse(
                 "index.html",
-                {"request": request, "filename": file.filename, "text": preview_text, "json_str": pretty},
+                {"request": request, "filename": file.filename, "text": preview_text, "json_str": pretty, "debug_raw": debug_raw},
             )
         return JSONResponse(payload)
     except HTTPException:
@@ -148,8 +157,14 @@ async def extract_file(file: UploadFile = File(...)):
         text = _read_file_to_text(raw_bytes, filename=file.filename)
         if not text or not text.strip():
             raise HTTPException(status_code=400, detail="Не удалось получить текст из файла.")
-        onec_json = _to_onec_fn(text) if _to_onec_fn else {}
-        payload = {"ok": True, "errors": [], "data": onec_json, "filename": file.filename, "length": len(text)}
+        onec_result = _to_onec_fn(text) if _to_onec_fn else {}
+        if isinstance(onec_result, dict) and "data" in onec_result:
+            onec_json = onec_result.get("data", {})
+            debug_raw = onec_result.get("_debug_raw")
+        else:
+            onec_json = onec_result
+            debug_raw = None
+        payload = {"ok": True, "errors": [], "data": onec_json, "filename": file.filename, "length": len(text), "debug_raw": debug_raw}
         global LAST_JSON_RESULT
         LAST_JSON_RESULT = payload
         return JSONResponse(payload)

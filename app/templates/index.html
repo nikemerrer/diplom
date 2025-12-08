@@ -50,6 +50,10 @@
           </form>
           <h3>Просмотр</h3>
           <pre>{{ json_str }}</pre>
+          {% if debug_raw %}
+            <h3>Ответ модели (debug_raw)</h3>
+            <pre>{{ debug_raw }}</pre>
+          {% endif %}
         {% else %}
           <p class="muted">Загрузите документ слева, чтобы увидеть результат.</p>
         {% endif %}
