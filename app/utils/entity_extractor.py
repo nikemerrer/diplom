@@ -31,6 +31,7 @@ SEED = int(os.getenv("OLLAMA_SEED", "42"))
 MAX_INPUT_CHARS = os.getenv("MAX_INPUT_CHARS")  # пусто -> не обрезаем
 MAX_CHAR_BUFFER = os.getenv("MAX_CHAR_BUFFER")  # пусто -> не задаём, иначе используем
 MAX_EXAMPLE_CHARS = int(os.getenv("MAX_EXAMPLE_CHARS", "0"))  # 0 = не обрезать примеры
+MAX_EXAMPLES = max(int(os.getenv("MAX_EXAMPLES", "1")), 0)  # сколько few-shot оставляем в prompt
 
 # ------------------ ШАБЛОН ПОЛЕЙ 1С ------------------
 EMPTY_PARTY = {"сторона": "", "наименование": "", "подписан": "", "дата": "", "комментарий": ""}
@@ -107,12 +108,14 @@ def _coerce_examples(raw) -> list:
 
 
 def _load_examples() -> list:
-    """Берём примеры из utils/examples.py (режем до 1 шт.), если нет — пустой список."""
+    """Берём примеры из utils/examples.py (по умолчанию первый), если нет — пустой список."""
     try:
         from .examples import EXAMPLES as USER_EXAMPLES  # type: ignore
         user_ex = _coerce_examples(USER_EXAMPLES)
         if user_ex:
-            return user_ex[:1]
+            if MAX_EXAMPLES == 0:
+                return []
+            return user_ex[:MAX_EXAMPLES]
     except Exception:
         pass
     return []

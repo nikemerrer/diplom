@@ -2,8 +2,11 @@
 # -*- coding: utf-8 -*-
 import os
 import io
+import sys
+import html
 import json
 import inspect
+import tempfile
 from typing import Any, Dict, Optional, Tuple, List
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
@@ -15,6 +18,22 @@ from fastapi.middleware.cors import CORSMiddleware
 BASE_DIR = os.path.dirname(__file__)
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
+PREVIEW_CHARS = int(os.getenv("PREVIEW_CHARS", "6000"))
+
+# Включаем локальную копию langextract, если pip-модуля нет (например, папка ../langextract-main)
+try:
+    import importlib.util as _importlib_util
+
+    if _importlib_util.find_spec("langextract") is None:
+        POSSIBLE_LX_DIRS = [
+            os.path.abspath(os.path.join(BASE_DIR, "..", "langextract-main")),
+            os.path.abspath(os.path.join(BASE_DIR, "..", "langextract")),
+        ]
+        for _p in POSSIBLE_LX_DIRS:
+            if os.path.isdir(_p) and _p not in sys.path:
+                sys.path.insert(0, _p)
+except Exception:
+    pass
 
 app = FastAPI(title="Contract Extractor → 1C JSON")
 
@@ -53,6 +72,50 @@ except Exception:
 if _to_onec_fn is None and _extract_fn is None:
     raise RuntimeError("Не найден utils/entity_extractor.py с нужными функциями.")
 
+
+def _import_langextract():
+    """
+    Ленивый импорт langextract из локальной папки или окружения.
+    Если нет pandas, подставляем простой заглушечный модуль, чтобы сработали io/visualize.
+    """
+    try:
+        import langextract as lx  # type: ignore
+        return lx
+    except ModuleNotFoundError as e:
+        if e.name == "pandas":
+            import types
+
+            def _missing_pandas(*args, **kwargs):
+                raise ModuleNotFoundError("pandas не установлен; установите его или добавьте в зависимости.")
+
+            dummy_pd = types.SimpleNamespace(read_csv=_missing_pandas, DataFrame=None)
+            sys.modules["pandas"] = dummy_pd
+            # tqdm заглушка
+            dummy_tqdm_mod = types.SimpleNamespace()
+            class _DummyTqdm:
+                def __init__(self, *a, **k): pass
+                def update(self, *a, **k): pass
+                def close(self): pass
+            dummy_tqdm_mod.tqdm = _DummyTqdm
+            sys.modules.setdefault("tqdm", dummy_tqdm_mod)
+            # absl.logging заглушка
+            import logging
+            class _AbslLogger:
+                def __init__(self):
+                    self._log = logging.getLogger("absl")
+                def debug(self, *a, **k): self._log.debug(*a, **k)
+                def info(self, *a, **k): self._log.info(*a, **k)
+                def warning(self, *a, **k): self._log.warning(*a, **k)
+                def error(self, *a, **k): self._log.error(*a, **k)
+                def fatal(self, *a, **k): self._log.critical(*a, **k)
+            absl_mod = types.SimpleNamespace(logging=_AbslLogger())
+            sys.modules.setdefault("absl", absl_mod)
+            sys.modules.setdefault("absl.logging", absl_mod.logging)
+
+            import langextract as lx  # type: ignore
+            return lx
+        raise
+
 def _read_file_to_text(file_bytes: bytes, filename: Optional[str]) -> str:
     candidates = [
         ("read_file_to_text", {"file_bytes": file_bytes, "filename": filename}),
@@ -90,6 +153,7 @@ async def health():
     return "ok"
 
 LAST_JSON_RESULT: Optional[Dict[str, Any]] = None
+LAST_TEXT: Optional[str] = None
 
 @app.post("/", response_class=HTMLResponse)
 async def upload_via_root(request: Request, file: UploadFile = File(...)):
@@ -122,8 +186,7 @@ async def upload_via_root(request: Request, file: UploadFile = File(...)):
             debug_raw = None
 
         pretty = json.dumps(onec_json, ensure_ascii=False, indent=2)
-        preview_chars = int(os.getenv("PREVIEW_CHARS", "6000"))
-        preview_text = text[:preview_chars]
+        preview_text = text[:PREVIEW_CHARS]
 
         payload = {
             "ok": True,
@@ -132,10 +195,13 @@ async def upload_via_root(request: Request, file: UploadFile = File(...)):
             "filename": file.filename,
             "length": len(text),
             "debug_raw": debug_raw,
+            "preview_text": preview_text,
         }
 
         global LAST_JSON_RESULT
         LAST_JSON_RESULT = payload
+        global LAST_TEXT
+        LAST_TEXT = text
 
         if templates:
             return templates.TemplateResponse(
@@ -164,9 +230,20 @@ async def extract_file(file: UploadFile = File(...)):
         else:
             onec_json = onec_result
             debug_raw = None
-        payload = {"ok": True, "errors": [], "data": onec_json, "filename": file.filename, "length": len(text), "debug_raw": debug_raw}
+        preview_text = text[:PREVIEW_CHARS]
+        payload = {
+            "ok": True,
+            "errors": [],
+            "data": onec_json,
+            "filename": file.filename,
+            "length": len(text),
+            "debug_raw": debug_raw,
+            "preview_text": preview_text,
+        }
         global LAST_JSON_RESULT
         LAST_JSON_RESULT = payload
+        global LAST_TEXT
+        LAST_TEXT = text
         return JSONResponse(payload)
     except HTTPException:
         raise
@@ -200,3 +277,85 @@ async def download_json_get(filename: Optional[str] = None):
     fname = filename or "onec_fields.json"
     headers = {"Content-Disposition": f'attachment; filename="{fname}"'}
     return StreamingResponse(io.BytesIO(content_bytes), media_type="application/json", headers=headers)
+
+
+@app.get("/visualization", response_class=HTMLResponse)
+async def visualization():
+    if not LAST_JSON_RESULT or "data" not in LAST_JSON_RESULT:
+        raise HTTPException(status_code=404, detail="Нет данных для визуализации. Сначала загрузите документ.")
+    if LAST_TEXT is None:
+        raise HTTPException(status_code=404, detail="Нет текста документа для визуализации.")
+
+    attrs = LAST_JSON_RESULT.get("data") or {}
+    title = ""
+    if isinstance(attrs, dict):
+        title = attrs.get("заголовок") or attrs.get("title") or ""
+    title = title or LAST_JSON_RESULT.get("filename") or "Документ"
+    text = LAST_TEXT or ""
+    if not text:
+        raise HTTPException(status_code=400, detail="Пустой текст, нечего визуализировать.")
+
+    try:
+        lx = _import_langextract()
+        lx_data = lx.data
+        lx_io = lx.io
+        extraction = lx_data.Extraction(
+            extraction_class="onec_fields",
+            extraction_text=str(title),
+            attributes=attrs if isinstance(attrs, dict) else {},
+            char_interval=lx_data.CharInterval(start_pos=0, end_pos=max(1, len(text))),
+        )
+        annotated = lx_data.AnnotatedDocument(
+            document_id=str(LAST_JSON_RESULT.get("filename") or "doc"),
+            text=text,
+            extractions=[extraction],
+        )
+        with tempfile.TemporaryDirectory(prefix="lxviz_") as tmpdir:
+            lx_io.save_annotated_documents([annotated], output_dir=tmpdir, output_name="extraction_results.jsonl", show_progress=False)
+            jsonl_path = os.path.join(tmpdir, "extraction_results.jsonl")
+            html_content = lx.visualize(jsonl_path, show_legend=True, gif_optimized=True)
+        if hasattr(html_content, "data"):
+            html_content = html_content.data  # type: ignore[attr-defined]
+        return HTMLResponse(content=html_content)
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Fallback: простая HTML-страница без langextract (например, отсутствуют зависимости)
+        fallback_html = f"""
+        <html>
+        <head>
+          <meta charset='utf-8'>
+          <title>Визуализация (fallback)</title>
+          <style>
+            body {{ background:#0b1224; color:#e5e7eb; font-family: 'Manrope', 'Segoe UI', sans-serif; margin:0; padding:24px; }}
+            .wrap {{ max-width: 1000px; margin: 0 auto; }}
+            .header {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; }}
+            .pill {{ padding:6px 10px; border-radius:999px; background:rgba(255,255,255,0.08); color:#cbd5e1; font-size:12px; }}
+            .panel {{ background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.08); border-radius:16px; padding:16px; margin-bottom:14px; }}
+            pre {{ background:#0a0f1f; border:1px solid rgba(255,255,255,0.08); padding:12px; border-radius:12px; overflow:auto; }}
+            textarea {{ width:100%; min-height:320px; border-radius:12px; border:1px solid rgba(255,255,255,0.08); background:#0d152b; color:#e5e7eb; padding:12px; }}
+            .muted {{ color:#94a3b8; font-size:13px; }}
+          </style>
+        </head>
+        <body>
+          <div class="wrap">
+            <div class="header">
+              <h2 style="margin:0">Визуализация (упрощённая)</h2>
+              <span class="pill">LangExtract недоступен: {html.escape(str(e))}</span>
+            </div>
+            <div class="panel">
+              <p class="muted">Показываем текст и извлечённые атрибуты. Для полноценной подсветки установите зависимости langextract (pandas, absl, tqdm и др.).</p>
+            </div>
+            <div class="panel">
+              <h3 style="margin-top:0">Текст</h3>
+              <textarea readonly>{html.escape(text)}</textarea>
+            </div>
+            <div class="panel">
+              <h3 style="margin-top:0">JSON</h3>
+              <pre>{html.escape(json.dumps(attrs, ensure_ascii=False, indent=2))}</pre>
+            </div>
+          </div>
+        </body>
+        </html>
+        """
+        return HTMLResponse(content=fallback_html)
