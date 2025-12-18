@@ -1,0 +1,39 @@
+# можно без version:, Docker Desktop поймёт спецификацию
+x-ollama-model: &ollama_model ${MODEL_ID:-ministral-3:3b}
+
+services:
+  ollama:
+    build: ./ollama
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    environment:
+      MODEL_ID: *ollama_model
+      # не обязательно, но не мешает
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    gpus: all            # <<< ВАЖНО: заменяет device_requests
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: app/Dockerfile
+    container_name: fastapi_app
+    environment:
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL_ID: *ollama_model
+      TEMPERATURE: 0.0
+      OLLAMA_NUM_PREDICT: -1
+      OLLAMA_TIMEOUT: 300
+      OLLAMA_NUM_CTX: 32768
+    ports:
+      - "8000:8000"
+    depends_on:
+      - ollama
+    restart: unless-stopped
+
+volumes:
+  ollama-data:

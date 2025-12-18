@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Извлечение реквизитов договора</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
+</head>
+<body>
+  <div class="page">
+    <header class="hero">
+      <div class="badge">Contract Extractor → 1C JSON</div>
+      <h1>Извлечение реквизитов договора</h1>
+      <p class="lede">Загрузи неструктурированный документ, получи JSON для 1С и сразу скачай результат. Есть превью текста и отладочный ответ модели.</p>
+      <div class="hero-meta">
+        <span class="pill">Поддерживаем: .docx, .doc, .pdf, .txt</span>
+        <span class="pill">POST /api/extract-file → multipart/form-data (file)</span>
+      </div>
+    </header>
+
+    <main class="grid">
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Шаг 1</p>
+            <h2>Загрузка файла</h2>
+          </div>
+          {% if filename %}
+            <span class="tag success">Выбран: {{ filename }}</span>
+          {% endif %}
+        </div>
+        <form id="upload-form" class="upload" method="post" action="/" enctype="multipart/form-data">
+          <label class="dropzone" id="dropzone">
+            <input id="file-input" type="file" name="file" accept=".doc,.docx,.pdf,.txt" required>
+            <div class="drop-hint">
+              <strong>Перетащи файл сюда</strong>
+              <span>или выбери на диске</span>
+              <small>До нескольких мегабайт, без ограничений по страницам</small>
+            </div>
+            <div class="file-name" id="file-name">Файл не выбран</div>
+          </label>
+          <div class="actions">
+            <button class="btn primary" type="submit">Обработать</button>
+            <p class="muted">Текст ограничивается переменной окружения <code>PREVIEW_CHARS</code> (по умолчанию 6000 символов).</p>
+          </div>
+        </form>
+
+        <div class="preview">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Шаг 2</p>
+              <h3>Превью текста</h3>
+            </div>
+            {% if text %}
+              <span class="tag">{{ text|length }} символов</span>
+            {% endif %}
+          </div>
+          <textarea id="preview-text" readonly placeholder="Текст документа появится здесь после загрузки.">{{ text }}</textarea>
+        </div>
+      </section>
+
+      <section class="panel result">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Шаг 3</p>
+            <h2>Результат (JSON)</h2>
+          </div>
+          <form id="download-form" method="post" action="/download-json">
+            <input id="download-json-input" type="hidden" name="json_payload" value="{% if json_str %}{{ json_str }}{% endif %}">
+            <button id="download-btn" class="btn ghost" type="submit" {% if not json_str %}disabled title="Сначала обработайте документ"{% endif %}>Скачать JSON</button>
+          </form>
+        </div>
+
+        <div id="result-empty" class="empty-state" {% if json_str %}style="display:none"{% endif %}>
+          <p>Загрузите документ слева, чтобы увидеть извлечённые реквизиты и скачать JSON.</p>
+          <div class="tips">
+            <span>Используется Ollama модель: <strong>{{ model_id or "qwen2.5:7b" }}</strong></span>
+            <span>Few-shot примеры: <code>utils/examples.py</code></span>
+          </div>
+        </div>
+
+        <div id="result-block" class="code-block" {% if not json_str %}style="display:none"{% endif %}>
+          <div class="panel-head">
+            <h3>Структура 1С</h3>
+            <span class="tag" id="json-length">{% if json_str %}{{ json_str|length }} символов{% endif %}</span>
+          </div>
+          <pre id="json-output">{{ json_str }}</pre>
+        </div>
+
+        <details id="debug-block" class="accordion" {% if debug_raw %}open{% else %}style="display:none"{% endif %}>
+          <summary>Ответ модели (debug_raw)</summary>
+          <pre id="debug-output">{% if debug_raw %}{{ debug_raw }}{% endif %}</pre>
+        </details>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <div class="footer-meta">
+        <span>API: POST <code>/api/extract-file</code> (поле <code>file</code>)</span>
+        <span>JSON можно скачать кнопкой или через GET <code>/download-json</code></span>
+      </div>
+    </footer>
+  </div>
+
+  <div id="loader" class="loader hidden">
+    <div class="spinner"></div>
+    <div class="loader-text">
+      <strong>Извлекаем реквизиты…</strong>
+      <span>Это может занять до ~30 секунд</span>
+    </div>
+  </div>
+
+  <script>
+    const fileInput = document.getElementById('file-input');
+    const fileName = document.getElementById('file-name');
+    const form = document.getElementById('upload-form');
+    const preview = document.getElementById('preview-text');
+    const loader = document.getElementById('loader');
+    const resultBlock = document.getElementById('result-block');
+    const resultEmpty = document.getElementById('result-empty');
+    const jsonOutput = document.getElementById('json-output');
+    const jsonLength = document.getElementById('json-length');
+    const debugBlock = document.getElementById('debug-block');
+    const debugOutput = document.getElementById('debug-output');
+    const downloadBtn = document.getElementById('download-btn');
+    const downloadInput = document.getElementById('download-json-input');
+    const dropzone = document.getElementById('dropzone');
+
+    if (fileInput && fileName) {
+      fileInput.addEventListener('change', () => {
+        fileName.textContent = fileInput.files?.[0]?.name || 'Файл не выбран';
+      });
+
+      if (dropzone) {
+        const setFile = (file) => {
+          const dt = new DataTransfer();
+          dt.items.add(file);
+          fileInput.files = dt.files;
+          fileName.textContent = file.name;
+        };
+
+        dropzone.addEventListener('dragover', (e) => {
+          e.preventDefault();
+          dropzone.classList.add('is-drag');
+        });
+
+        dropzone.addEventListener('dragleave', () => {
+          dropzone.classList.remove('is-drag');
+        });
+
+        dropzone.addEventListener('drop', (e) => {
+          e.preventDefault();
+          dropzone.classList.remove('is-drag');
+          const file = e.dataTransfer?.files?.[0];
+          if (file) setFile(file);
+        });
+      }
+    }
+
+    function showLoader(show) {
+      if (!loader) return;
+      loader.classList.toggle('hidden', !show);
+    }
+
+    function setResultVisible(hasData) {
+      if (resultBlock) resultBlock.style.display = hasData ? 'block' : 'none';
+      if (resultEmpty) resultEmpty.style.display = hasData ? 'none' : 'block';
+      if (downloadBtn) downloadBtn.disabled = !hasData;
+    }
+
+    async function handleSubmit(evt) {
+      if (!form) return;
+      evt.preventDefault();
+      if (!fileInput?.files?.length) {
+        alert('Выберите файл');
+        return;
+      }
+      const fd = new FormData(form);
+      showLoader(true);
+      setResultVisible(false);
+      try {
+        const res = await fetch('/api/extract-file', { method: 'POST', body: fd });
+        if (!res.ok) throw new Error('Ошибка ' + res.status);
+        const data = await res.json();
+        const pretty = JSON.stringify(data.data || {}, null, 2);
+        if (jsonOutput) jsonOutput.textContent = pretty;
+        if (jsonLength) jsonLength.textContent = (pretty.length || 0) + ' символов';
+        if (preview) preview.value = data.preview_text || '';
+        if (debugOutput) {
+          debugOutput.textContent = data.debug_raw || '';
+          debugBlock.style.display = data.debug_raw ? 'block' : 'none';
+        }
+        setResultVisible(true);
+        // заполняем скачивание
+        if (downloadInput) downloadInput.value = pretty;
+        if (downloadBtn) {
+          downloadBtn.disabled = false;
+          downloadBtn.title = '';
+        }
+      } catch (e) {
+        alert('Не удалось обработать файл: ' + e.message);
+        setResultVisible(false);
+      } finally {
+        showLoader(false);
+      }
+    }
+
+    if (form) {
+      form.addEventListener('submit', handleSubmit);
+    }
+  </script>
+</body>
+</html>
