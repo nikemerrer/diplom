@@ -8,7 +8,7 @@ for i in $(seq 1 120); do
   sleep 1
 done
 
-MODEL="${MODEL_ID:-gemma3:4b}"
+MODEL="${MODEL_ID:-qwen2.5:7b}"
 if ! ollama show "$MODEL" >/dev/null 2>&1; then
   echo "⬇️  Скачиваю модель $MODEL ..."
   ollama pull "$MODEL"

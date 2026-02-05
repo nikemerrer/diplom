@@ -7,9 +7,10 @@
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import langextract as lx
 
@@ -21,7 +22,8 @@ except Exception:
 
 # ---------------------- ПАРАМЕТРЫ ----------------------
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
-OLLAMA_MODEL_ID = os.getenv("OLLAMA_MODEL_ID", "qwen2.5:7b")
+# модель можно задать через OLLAMA_MODEL_ID или MODEL_ID (docker-compose)
+OLLAMA_MODEL_ID = os.getenv("OLLAMA_MODEL_ID") or os.getenv("MODEL_ID") or "qwen2.5:7b"
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.0"))
 NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "1024"))
 TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "300"))
@@ -31,6 +33,7 @@ SEED = int(os.getenv("OLLAMA_SEED", "42"))
 MAX_INPUT_CHARS = os.getenv("MAX_INPUT_CHARS")  # пусто -> не обрезаем
 MAX_CHAR_BUFFER = os.getenv("MAX_CHAR_BUFFER")  # пусто -> не задаём, иначе используем
 MAX_EXAMPLE_CHARS = int(os.getenv("MAX_EXAMPLE_CHARS", "0"))  # 0 = не обрезать примеры
+MAX_EXAMPLES = max(int(os.getenv("MAX_EXAMPLES", "1")), 0)  # сколько few-shot оставляем в prompt
 
 # ------------------ ШАБЛОН ПОЛЕЙ 1С ------------------
 EMPTY_PARTY = {"сторона": "", "наименование": "", "подписан": "", "дата": "", "комментарий": ""}
@@ -107,12 +110,14 @@ def _coerce_examples(raw) -> list:
 
 
 def _load_examples() -> list:
-    """Берём примеры из utils/examples.py (режем до 1 шт.), если нет — пустой список."""
+    """Берём примеры из utils/examples.py (по умолчанию первый), если нет — пустой список."""
     try:
         from .examples import EXAMPLES as USER_EXAMPLES  # type: ignore
         user_ex = _coerce_examples(USER_EXAMPLES)
         if user_ex:
-            return user_ex[:1]
+            if MAX_EXAMPLES == 0:
+                return []
+            return user_ex[:MAX_EXAMPLES]
     except Exception:
         pass
     return []
@@ -197,8 +202,9 @@ def extract_onec_fields(text: str) -> Dict[str, Any]:
         if isinstance(parsed, dict):
             exs = parsed.get("extractions") or []
             for ex in exs:
-                if isinstance(ex, dict) and ex.get("extraction_class") == "onec_fields" and isinstance(ex.get("attributes"), dict):
-                    return {"data": ex["attributes"], "_debug_raw": raw_response}
+                if isinstance(ex, dict) and ex.get("extraction_class") == "onec_fields":
+                    merged = _merge_extraction(ex)
+                    return {"data": merged, "_debug_raw": raw_response}
     except Exception as e:
         return {"_error": str(e), "data": ONEC_TEMPLATE, "_debug_raw": raw_response}
 
@@ -236,3 +242,24 @@ def _parse_first_json(raw: str) -> Dict[str, Any]:
         except Exception:
             continue
     return {}
+
+
+def _merge_extraction(extraction: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Берём attributes из extraction и добавляем остальные поля (рег_номер, дата, реквизиты и т.п.),
+    чтобы не терять данные, которые модель положила на верхний уровень extraction.
+    """
+    base = copy.deepcopy(ONEC_TEMPLATE)
+    attributes = extraction.get("attributes") if isinstance(extraction.get("attributes"), dict) else {}
+    merged: Dict[str, Any] = {}
+    merged.update(attributes)
+
+    for key, val in extraction.items():
+        if key in {"extraction_class", "extraction_text", "attributes"}:
+            continue
+        # если ключа нет в атрибутах, добавляем; если есть и пустой, заполняем значением сверху
+        if key not in merged or merged.get(key) in (None, "", 0):
+            merged[key] = val
+
+    base.update(merged)
+    return base

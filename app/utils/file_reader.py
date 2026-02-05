@@ -146,6 +146,7 @@ def _read_pdf(b: bytes) -> str:
             pass
     # OCR для сканированных PDF
     ocr_lang = os.getenv("OCR_LANG", "rus+eng")
+    print(ocr_lang)
     if convert_from_bytes is not None and pytesseract is not None:
         try:
             images = convert_from_bytes(b)
