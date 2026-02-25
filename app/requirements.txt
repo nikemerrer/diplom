@@ -10,3 +10,4 @@ striprtf
 pdf2image
 pytesseract
 Pillow
+requests
