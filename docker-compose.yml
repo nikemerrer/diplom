@@ -1,5 +1,5 @@
 # можно без version:, Docker Desktop поймёт спецификацию
-x-ollama-model: &ollama_model ${MODEL_ID:-ministral-3:3b}
+x-ollama-model: &ollama_model ${MODEL_ID:-qwen2.5:1.5b}
 
 services:
   ollama:

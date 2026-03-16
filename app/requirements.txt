@@ -11,3 +11,10 @@ pdf2image
 pytesseract
 Pillow
 requests
+typing
+python-docx
+PyPDF2
+pdfminer.six
+pdf2image
+pytesseract
+striprtf

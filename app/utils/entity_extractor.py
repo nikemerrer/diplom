@@ -1,265 +1,359 @@
 # -*- coding: utf-8 -*-
 """
-Минимальный извлекатель полей 1С на базе langextract + Ollama.
-— Читаем текст целиком (без собственного чанкинга, библиотека сама разрежет).
-— Few-shot примеры берём из utils/examples.py.
-— Возвращаем 1С-атрибуты + отладочное сырое содержимое ответа модели, чтобы видеть, что пришло.
+Извлечение сущностей для 1С:Документооборот на базе LangExtract + Ollama.
+
+Результат:
+- onec_fields: только то, что реально пишется в 1С
+- extra_findings: дополнительные сущности для вывода в сообщениях
+- _meta: служебная информация
+
+Важно:
+- комментарий НЕ извлекается
+- examples реально ограничиваются через MAX_EXAMPLES и MAX_EXAMPLE_CHARS
+- входной текст ограничивается через MAX_INPUT_CHARS
 """
-from __future__ import annotations
-
-import copy
-import json
 import os
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, Iterable, List
 
-import langextract as lx
-
-# Попытаться импортировать провайдер напрямую, иначе через lx.providers
 try:
-    from langextract.providers.ollama import OllamaLanguageModel
-except Exception:
-    OllamaLanguageModel = lx.providers.ollama.OllamaLanguageModel  # type: ignore
+    import langextract as lx
+except Exception as exc:
+    raise RuntimeError(
+        "Не установлен langextract. Добавь зависимость 'langextract' в requirements.txt "
+        "и пересобери контейнер."
+    ) from exc
 
-# ---------------------- ПАРАМЕТРЫ ----------------------
+
+# =========================================================
+# КОНФИГ
+# =========================================================
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
-# модель можно задать через OLLAMA_MODEL_ID или MODEL_ID (docker-compose)
-OLLAMA_MODEL_ID = os.getenv("OLLAMA_MODEL_ID") or os.getenv("MODEL_ID") or "qwen2.5:7b"
+MODEL_ID = os.getenv("OLLAMA_MODEL_ID") or os.getenv("MODEL_ID") or "qwen2.5:1.5b"
+
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.0"))
-NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "1024"))
-TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "300"))
-NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "32768"))
-SEED = int(os.getenv("OLLAMA_SEED", "42"))
+TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "900"))
+NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
 
-MAX_INPUT_CHARS = os.getenv("MAX_INPUT_CHARS")  # пусто -> не обрезаем
-MAX_CHAR_BUFFER = os.getenv("MAX_CHAR_BUFFER")  # пусто -> не задаём, иначе используем
-MAX_EXAMPLE_CHARS = int(os.getenv("MAX_EXAMPLE_CHARS", "0"))  # 0 = не обрезать примеры
-MAX_EXAMPLES = max(int(os.getenv("MAX_EXAMPLES", "1")), 0)  # сколько few-shot оставляем в prompt
+EXTRACTION_PASSES = int(os.getenv("LANGEXTRACT_PASSES", "1"))
+MAX_WORKERS = int(os.getenv("LANGEXTRACT_MAX_WORKERS", "1"))
 
-# ------------------ ШАБЛОН ПОЛЕЙ 1С ------------------
-EMPTY_PARTY = {"сторона": "", "наименование": "", "подписан": "", "дата": "", "комментарий": ""}
-ONEC_TEMPLATE: Dict[str, Any] = {
-    "вид_документа": "",
-    "заголовок": "",
-    "содержание": "",
-    "стороны": [EMPTY_PARTY.copy(), EMPTY_PARTY.copy()],
-    "комментарий": "",
-    "рег_номер": "",
-    "дата": "",
-    "временный_номер": None,
-    "реквизиты": {
-        "срок": {"с": None, "по": None},
-        "сумма": 0,
-        "валюта": None,
-        "ндс": None,
-    },
-    "срок_действия": None,
-    "делает_недействующими": False,
-    "гриф": None,
-    "проект": None,
-    "состояние": None,
-    "подразделение": None,
-    "подготовил": None,
-    "ответственный": None,
-    "хранение": {"состав": None, "форма": None, "в_дело": None},
-    "город": "",
-    "объект_наименование": None,
-    "объект_адрес": None,
-    "часы_охраны": None,
-    "периодичность_суммы": None,
-}
+MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "2500"))
+MAX_CHAR_BUFFER = int(os.getenv("LANGEXTRACT_MAX_CHAR_BUFFER", "2500"))
+MAX_EXAMPLE_CHARS = int(os.getenv("MAX_EXAMPLE_CHARS", "450"))
+MAX_EXAMPLES = max(int(os.getenv("MAX_EXAMPLES", "1")), 0)
 
-# ------------------ ПРИМЕРЫ ------------------
-def _coerce_examples(raw) -> list:
-    out = []
-    ExampleData = getattr(lx.data, "ExampleData", None)
-    Extraction = getattr(lx.data, "Extraction", None)
-    if not ExampleData or not Extraction or not isinstance(raw, list):
-        return out
-
-    for ex in raw:
-        if hasattr(ex, "text") and hasattr(ex, "extractions"):
-            # опционально укорачиваем текст примера, чтобы не раздувать prompt
-            if MAX_EXAMPLE_CHARS and isinstance(MAX_EXAMPLE_CHARS, int) and MAX_EXAMPLE_CHARS > 0:
-                try:
-                    truncated = ex.text[:MAX_EXAMPLE_CHARS]
-                    ex = ExampleData(text=truncated, extractions=ex.extractions)
-                except Exception:
-                    pass
-            out.append(ex)
-            continue
-        if isinstance(ex, dict):
-            text = ex.get("text") or ex.get("document") or ex.get("input")
-            attrs = ex.get("attrs") or ex.get("attributes")
-            title = ex.get("title") or "Документ"
-            if isinstance(text, str) and isinstance(attrs, dict):
-                if MAX_EXAMPLE_CHARS and isinstance(MAX_EXAMPLE_CHARS, int) and MAX_EXAMPLE_CHARS > 0:
-                    text = text[:MAX_EXAMPLE_CHARS]
-                out.append(
-                    ExampleData(
-                        text=text,
-                        extractions=[
-                            Extraction(
-                                extraction_class="onec_fields",
-                                extraction_text=title,
-                                attributes=attrs,
-                            )
-                        ],
-                    )
-                )
-    return out
+SAVE_LANGEXTRACT_ARTIFACTS = os.getenv("SAVE_LANGEXTRACT_ARTIFACTS", "0").lower() in {"1", "true", "yes"}
+LANGEXTRACT_ARTIFACT_DIR = os.getenv("LANGEXTRACT_ARTIFACT_DIR", "langextract_artifacts")
 
 
-def _load_examples() -> list:
-    """Берём примеры из utils/examples.py (по умолчанию первый), если нет — пустой список."""
-    try:
-        from .examples import EXAMPLES as USER_EXAMPLES  # type: ignore
-        user_ex = _coerce_examples(USER_EXAMPLES)
-        if user_ex:
-            if MAX_EXAMPLES == 0:
-                return []
-            return user_ex[:MAX_EXAMPLES]
-    except Exception:
-        pass
-    return []
+PROMPT_DESCRIPTION = """
+Извлекай сущности из русского делового документа в порядке появления в тексте.
 
-
-# ------------------ ПРОМПТ ------------------
-PROMPT_ONEC = """
-Ты извлекаешь реквизиты формы 1С «Документооборот». Верни ТОЛЬКО валидный JSON LangExtract:
-{"extractions":[{"extraction_class":"onec_fields","extraction_text":"<краткое название/номер>","attributes":{...}}]}
-
-Правила:
-- Никакого текста вне JSON, никаких пояснений и Markdown.
-- Пустые значения по типу: "" / null / 0. Валюта по умолчанию RUB.
-- «подписан» — только ФИО без должности. Даты → YYYY-MM-DD. Суммы → целое число.
-- Если данных нет — оставь пустые значения по типу.
-- Опирайся на примеры, которые даны.
+Главные правила:
+1. extraction_text должен быть дословным фрагментом исходного документа.
+2. Не выдумывай сущности, которых нет в тексте.
+3. Извлекай только реально встречающиеся значения.
+4. Чётко различай:
+   - customer_organization = организация-заказчик
+   - executor_organization = организация-исполнитель
+   - department = подразделение, только если оно явно указано в документе
+5. person_full_name извлекай только для реальных физических лиц, явно упомянутых в документе.
+6. Если ФИО в косвенном падеже, в normalized_full_name приводи к форме, пригодной для поиска в 1С.
+7. Если заголовок документа разбит на несколько строк, в canonical_title собери его в одну строку.
+8. Извлекай:
+   - сущности для автозаполнения 1С
+   - дополнительные полезные сущности для вывода пользователю
+9. Не извлекай пустые сущности.
 """.strip()
 
 
-# ------------------ МОДЕЛЬ ------------------
-def _build_model() -> Any:
-    try:
-        return OllamaLanguageModel(
-            model_id=OLLAMA_MODEL_ID,
-            model_url=OLLAMA_URL,
-            options={"temperature": TEMPERATURE, "num_predict": NUM_PREDICT, "num_ctx": NUM_CTX, "seed": SEED},
-            timeout=TIMEOUT,
-        )
-    except TypeError:
-        try:
-            return OllamaLanguageModel(OLLAMA_MODEL_ID, OLLAMA_URL, options={"temperature": TEMPERATURE, "num_predict": NUM_PREDICT, "num_ctx": NUM_CTX, "seed": SEED})
-        except Exception:
-            return OllamaLanguageModel(OLLAMA_MODEL_ID, OLLAMA_URL)
-
-
-# ------------------ ОСНОВНАЯ ФУНКЦИЯ ------------------
+# =========================================================
+# ПУБЛИЧНАЯ ФУНКЦИЯ
+# =========================================================
 def extract_onec_fields(text: str) -> Dict[str, Any]:
-    # Обрезаем при необходимости (опционально через env)
-    if MAX_INPUT_CHARS:
-        try:
-            limit = int(MAX_INPUT_CHARS)
-            if limit > 0 and len(text) > limit:
-                text = text[:limit]
-        except Exception:
-            pass
+    prepared_text = _prepare_input_text(text)
+    if not prepared_text:
+        raise RuntimeError("На вход извлекателя пришёл пустой текст документа")
 
     examples = _load_examples()
-    prompt_parts: List[str] = [PROMPT_ONEC]
-    if examples:
-        ex = examples[0]
-        ex_json = {
-            "extractions": [
-                {
-                    "extraction_class": "onec_fields",
-                    "extraction_text": getattr(ex.extractions[0], "extraction_text", "") if ex.extractions else "Документ",
-                    "attributes": getattr(ex.extractions[0], "attributes", {}) if ex.extractions else {},
-                }
-            ]
-        }
-        prompt_parts.append("\n\nПример:\nТекст:\n" + ex.text + "\nJSON:\n" + json.dumps(ex_json, ensure_ascii=False))
-    prompt_parts.append("\n\nДокумент:\n" + text)
-    prompt_parts.append("\nОтвет: только JSON.")
-    prompt = "\n".join(prompt_parts)
+    annotated = _run_langextract(prepared_text, examples)
+    normalized_entities = _normalize_annotated_document(annotated)
+    result = _assemble_result(normalized_entities)
 
-    body = {
-        "model": OLLAMA_MODEL_ID,
-        "prompt": prompt,
-        "stream": False,
-        "format": "json",  # просим чистый JSON без Markdown
-        "options": {"temperature": TEMPERATURE, "num_predict": NUM_PREDICT, "num_ctx": NUM_CTX, "seed": SEED},
-    }
+    if SAVE_LANGEXTRACT_ARTIFACTS:
+        _save_artifacts(annotated)
 
-    raw_response = None
-    try:
-        import requests
-
-        resp = requests.post(OLLAMA_URL.rstrip("/") + "/api/generate", json=body, timeout=TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        raw_response = data.get("response") or data.get("data") or ""
-        parsed = _parse_first_json(raw_response)
-        if isinstance(parsed, dict):
-            exs = parsed.get("extractions") or []
-            for ex in exs:
-                if isinstance(ex, dict) and ex.get("extraction_class") == "onec_fields":
-                    merged = _merge_extraction(ex)
-                    return {"data": merged, "_debug_raw": raw_response}
-    except Exception as e:
-        return {"_error": str(e), "data": ONEC_TEMPLATE, "_debug_raw": raw_response}
-
-    return {"data": ONEC_TEMPLATE, "_debug_raw": raw_response}
+    return result
 
 
-# Совместимость
-def extract_entities_from_text(text: str) -> Dict[str, Any]:
-    return extract_onec_fields(text)
+# совместимость со старым названием
+extract_entities_from_text = extract_onec_fields
 
 
-# ------------------ ВСПОМОГАТЕЛЬНОЕ ------------------
-_JSON_RE = None
-def _strip_markdown_fences(raw: str) -> str:
-    import re
-
-    if not raw:
-        return raw
-    cleaned = raw.strip()
-    cleaned = re.sub(r"^```[a-zA-Z0-9]*\s*", "", cleaned)
-    cleaned = re.sub(r"\s*```$", "", cleaned)
+# =========================================================
+# ПОДГОТОВКА ВХОДНОГО ТЕКСТА
+# =========================================================
+def _prepare_input_text(text: str) -> str:
+    cleaned = (text or "").replace("\x00", " ").strip()
+    if MAX_INPUT_CHARS > 0 and len(cleaned) > MAX_INPUT_CHARS:
+        return cleaned[:MAX_INPUT_CHARS]
     return cleaned
 
 
-def _parse_first_json(raw: str) -> Dict[str, Any]:
-    global _JSON_RE
-    if _JSON_RE is None:
-        _JSON_RE = __import__("re").compile(r"\{[\s\S]*\}")
-    text = _strip_markdown_fences(raw or "")
-    for m in _JSON_RE.finditer(text):
-        try:
-            data = json.loads(m.group(0))
-            if isinstance(data, dict) and "extractions" in data:
-                return data
-        except Exception:
+# =========================================================
+# FEW-SHOT ПРИМЕРЫ
+# =========================================================
+def _load_examples():
+    from .examples import EXAMPLES
+    return [EXAMPLES[0]]
+
+# =========================================================
+# ВЫЗОВ LANGEXTRACT
+# =========================================================
+def _run_langextract(text: str, examples: List[Any]) -> Any:
+    kwargs: Dict[str, Any] = {
+        "text_or_documents": text,
+        "prompt_description": PROMPT_DESCRIPTION,
+        "examples": examples,
+        "model_id": MODEL_ID,
+        "model_url": OLLAMA_URL,
+        "fence_output": False,
+        "use_schema_constraints": False,
+        "temperature": TEMPERATURE,
+        "extraction_passes": EXTRACTION_PASSES,
+        "max_workers": MAX_WORKERS,
+        "max_char_buffer": MAX_CHAR_BUFFER,
+        "language_model_params": {
+            "num_ctx": NUM_CTX,
+            "timeout": TIMEOUT,
+        },
+    }
+
+    try:
+        return lx.extract(**kwargs)
+    except TypeError:
+        # совместимость со старыми версиями langextract
+        kwargs.pop("language_model_params", None)
+        return lx.extract(**kwargs)
+
+
+# =========================================================
+# НОРМАЛИЗАЦИЯ РЕЗУЛЬТАТА LANGEXTRACT
+# =========================================================
+def _normalize_annotated_document(annotated: Any) -> List[Dict[str, Any]]:
+    extractions: Iterable[Any]
+
+    if hasattr(annotated, "extractions"):
+        extractions = getattr(annotated, "extractions") or []
+    elif isinstance(annotated, list) and len(annotated) == 1 and hasattr(annotated[0], "extractions"):
+        extractions = getattr(annotated[0], "extractions") or []
+    else:
+        extractions = []
+
+    normalized: List[Dict[str, Any]] = []
+
+    for item in extractions:
+        extraction_class = getattr(item, "extraction_class", "") or ""
+        extraction_text = getattr(item, "extraction_text", "") or ""
+        attributes = getattr(item, "attributes", {}) or {}
+        char_interval = getattr(item, "char_interval", None)
+
+        start_pos = None
+        end_pos = None
+        if char_interval is not None:
+            start_pos = getattr(char_interval, "start_pos", None)
+            end_pos = getattr(char_interval, "end_pos", None)
+
+        if not extraction_class or not extraction_text:
             continue
-    return {}
+
+        normalized.append(
+            {
+                "class": str(extraction_class),
+                "text": str(extraction_text).strip(),
+                "attributes": dict(attributes) if isinstance(attributes, dict) else {},
+                "start_pos": start_pos,
+                "end_pos": end_pos,
+            }
+        )
+
+    return normalized
 
 
-def _merge_extraction(extraction: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Берём attributes из extraction и добавляем остальные поля (рег_номер, дата, реквизиты и т.п.),
-    чтобы не терять данные, которые модель положила на верхний уровень extraction.
-    """
-    base = copy.deepcopy(ONEC_TEMPLATE)
-    attributes = extraction.get("attributes") if isinstance(extraction.get("attributes"), dict) else {}
-    merged: Dict[str, Any] = {}
-    merged.update(attributes)
+# =========================================================
+# СБОРКА ИТОГОВОГО JSON
+# =========================================================
+def _assemble_result(entities: List[Dict[str, Any]]) -> Dict[str, Any]:
+    onec_fields = {
+        "заголовок": "",
+        "организация_заказчик": "",
+        "подразделение": "",
+        "физические_лица": [],
+    }
 
-    for key, val in extraction.items():
-        if key in {"extraction_class", "extraction_text", "attributes"}:
+    extra_findings = {
+        "вид_документа": "",
+        "номер_документа": "",
+        "дата_документа": "",
+        "город": "",
+        "организация_исполнитель": "",
+        "контрагент": "",
+        "объект_наименование": "",
+        "объект_адрес": "",
+        "стоимость_услуг": "",
+        "режим_охраны": "",
+        "лицензия": "",
+        "подписанты": [],
+    }
+
+    seen_persons = set()
+    seen_signatories = set()
+
+    for entity in entities:
+        cls = entity["class"]
+        text = entity["text"]
+        attrs = entity.get("attributes") or {}
+
+        if cls == "document_title":
+            candidate = _clean_string(attrs.get("canonical_title") or text)
+            onec_fields["заголовок"] = _pick_better_title(onec_fields["заголовок"], candidate)
             continue
-        # если ключа нет в атрибутах, добавляем; если есть и пустой, заполняем значением сверху
-        if key not in merged or merged.get(key) in (None, "", 0):
-            merged[key] = val
 
-    base.update(merged)
-    return base
+        if cls == "customer_organization":
+            if not onec_fields["организация_заказчик"]:
+                onec_fields["организация_заказчик"] = _clean_string(attrs.get("normalized_name") or text)
+            continue
+
+        if cls == "department":
+            if not onec_fields["подразделение"]:
+                onec_fields["подразделение"] = _clean_string(attrs.get("normalized_name") or text)
+            continue
+
+        if cls == "person_full_name":
+            fio = _clean_string(attrs.get("normalized_full_name") or text)
+            if fio and fio not in seen_persons:
+                seen_persons.add(fio)
+                onec_fields["физические_лица"].append(fio)
+
+            role = _clean_string(attrs.get("role"))
+            signatory_value = fio or _clean_string(text)
+            if signatory_value and signatory_value not in seen_signatories:
+                seen_signatories.add(signatory_value)
+                extra_findings["подписанты"].append(
+                    {
+                        "фио": signatory_value,
+                        "роль": role,
+                    }
+                )
+            continue
+
+        if cls == "document_type" and not extra_findings["вид_документа"]:
+            extra_findings["вид_документа"] = _clean_string(attrs.get("normalized_value") or text)
+            continue
+
+        if cls == "document_number" and not extra_findings["номер_документа"]:
+            extra_findings["номер_документа"] = _clean_string(text)
+            continue
+
+        if cls == "document_date" and not extra_findings["дата_документа"]:
+            extra_findings["дата_документа"] = _clean_string(attrs.get("iso_date") or text)
+            continue
+
+        if cls == "city" and not extra_findings["город"]:
+            extra_findings["город"] = _clean_string(text)
+            continue
+
+        if cls == "executor_organization" and not extra_findings["организация_исполнитель"]:
+            extra_findings["организация_исполнитель"] = _clean_string(attrs.get("normalized_name") or text)
+            continue
+
+        if cls == "counterparty_organization" and not extra_findings["контрагент"]:
+            extra_findings["контрагент"] = _clean_string(attrs.get("normalized_name") or text)
+            continue
+
+        if cls == "object_name" and not extra_findings["объект_наименование"]:
+            extra_findings["объект_наименование"] = _clean_string(attrs.get("normalized_value") or text).strip('«»')
+            continue
+
+        if cls == "object_address" and not extra_findings["объект_адрес"]:
+            extra_findings["объект_адрес"] = _clean_string(text)
+            continue
+
+        if cls == "service_cost" and not extra_findings["стоимость_услуг"]:
+            amount = attrs.get("normalized_amount")
+            if amount not in (None, "", 0):
+                currency = _clean_string(attrs.get("currency")) or "RUB"
+                frequency = _clean_string(attrs.get("frequency"))
+                suffix = f" {frequency}" if frequency else ""
+                extra_findings["стоимость_услуг"] = f"{amount} {currency}{suffix}".strip()
+            else:
+                extra_findings["стоимость_услуг"] = _clean_string(text)
+            continue
+
+        if cls == "guard_schedule" and not extra_findings["режим_охраны"]:
+            extra_findings["режим_охраны"] = _clean_string(text)
+            continue
+
+        if cls == "license_info" and not extra_findings["лицензия"]:
+            extra_findings["лицензия"] = _clean_string(text)
+            continue
+
+    return {
+        "onec_fields": onec_fields,
+        "extra_findings": extra_findings,
+        "_meta": {
+            "engine": "langextract",
+            "model_id": MODEL_ID,
+            "entity_count": len(entities),
+        },
+    }
+
+
+# =========================================================
+# УТИЛИТЫ
+# =========================================================
+def _pick_better_title(current_value: str, new_value: str) -> str:
+    current_value = _clean_string(current_value)
+    new_value = _clean_string(new_value)
+
+    if not new_value:
+        return current_value
+    if not current_value:
+        return new_value
+
+    return new_value if len(new_value) > len(current_value) else current_value
+
+
+def _clean_string(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value)
+    text = text.replace("\r", " ").replace("\n", " ")
+    text = " ".join(text.split())
+    return text.strip()
+
+
+def _save_artifacts(annotated: Any) -> None:
+    artifact_dir = Path(LANGEXTRACT_ARTIFACT_DIR)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        lx.io.save_annotated_documents(
+            [annotated],
+            output_name="latest_extractions.jsonl",
+            output_dir=str(artifact_dir),
+        )
+    except Exception:
+        return
+
+    try:
+        html_content = lx.visualize(str(artifact_dir / "latest_extractions.jsonl"))
+        html_path = artifact_dir / "latest_visualization.html"
+        with html_path.open("w", encoding="utf-8") as f:
+            if hasattr(html_content, "data"):
+                f.write(html_content.data)
+            else:
+                f.write(str(html_content))
+    except Exception:
+        return
