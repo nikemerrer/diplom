@@ -97,7 +97,6 @@
       <div class="footer-meta">
         <span>API: POST <code>/api/extract-file</code> (поле <code>file</code>)</span>
         <span>JSON можно скачать кнопкой или через GET <code>/download-json</code></span>
-        <span><a href="/monitor">Мониторинг очереди</a></span>
       </div>
     </footer>
   </div>
@@ -110,6 +109,104 @@
     </div>
   </div>
 
-  <script src="{{ url_for('static', path='index.js') }}"></script>
+  <script>
+    const fileInput = document.getElementById('file-input');
+    const fileName = document.getElementById('file-name');
+    const form = document.getElementById('upload-form');
+    const preview = document.getElementById('preview-text');
+    const loader = document.getElementById('loader');
+    const resultBlock = document.getElementById('result-block');
+    const resultEmpty = document.getElementById('result-empty');
+    const jsonOutput = document.getElementById('json-output');
+    const jsonLength = document.getElementById('json-length');
+    const debugBlock = document.getElementById('debug-block');
+    const debugOutput = document.getElementById('debug-output');
+    const downloadBtn = document.getElementById('download-btn');
+    const downloadInput = document.getElementById('download-json-input');
+    const dropzone = document.getElementById('dropzone');
+
+    if (fileInput && fileName) {
+      fileInput.addEventListener('change', () => {
+        fileName.textContent = fileInput.files?.[0]?.name || 'Файл не выбран';
+      });
+
+      if (dropzone) {
+        const setFile = (file) => {
+          const dt = new DataTransfer();
+          dt.items.add(file);
+          fileInput.files = dt.files;
+          fileName.textContent = file.name;
+        };
+
+        dropzone.addEventListener('dragover', (e) => {
+          e.preventDefault();
+          dropzone.classList.add('is-drag');
+        });
+
+        dropzone.addEventListener('dragleave', () => {
+          dropzone.classList.remove('is-drag');
+        });
+
+        dropzone.addEventListener('drop', (e) => {
+          e.preventDefault();
+          dropzone.classList.remove('is-drag');
+          const file = e.dataTransfer?.files?.[0];
+          if (file) setFile(file);
+        });
+      }
+    }
+
+    function showLoader(show) {
+      if (!loader) return;
+      loader.classList.toggle('hidden', !show);
+    }
+
+    function setResultVisible(hasData) {
+      if (resultBlock) resultBlock.style.display = hasData ? 'block' : 'none';
+      if (resultEmpty) resultEmpty.style.display = hasData ? 'none' : 'block';
+      if (downloadBtn) downloadBtn.disabled = !hasData;
+    }
+
+    async function handleSubmit(evt) {
+      if (!form) return;
+      evt.preventDefault();
+      if (!fileInput?.files?.length) {
+        alert('Выберите файл');
+        return;
+      }
+      const fd = new FormData(form);
+      showLoader(true);
+      setResultVisible(false);
+      try {
+        const res = await fetch('/api/extract-file', { method: 'POST', body: fd });
+        if (!res.ok) throw new Error('Ошибка ' + res.status);
+        const data = await res.json();
+        const pretty = JSON.stringify(data.data || {}, null, 2);
+        if (jsonOutput) jsonOutput.textContent = pretty;
+        if (jsonLength) jsonLength.textContent = (pretty.length || 0) + ' символов';
+        if (preview) preview.value = data.preview_text || '';
+        if (debugOutput) {
+          debugOutput.textContent = data.debug_raw || '';
+          debugBlock.style.display = data.debug_raw ? 'block' : 'none';
+        }
+        setResultVisible(true);
+        // заполняем скачивание
+        if (downloadInput) downloadInput.value = pretty;
+        if (downloadBtn) {
+          downloadBtn.disabled = false;
+          downloadBtn.title = '';
+        }
+      } catch (e) {
+        alert('Не удалось обработать файл: ' + e.message);
+        setResultVisible(false);
+      } finally {
+        showLoader(false);
+      }
+    }
+
+    if (form) {
+      form.addEventListener('submit', handleSubmit);
+    }
+  </script>
 </body>
 </html>

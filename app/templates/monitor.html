@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Мониторинг очереди и обработки</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
+</head>
+<body>
+  <div class="page monitor-page">
+    <header class="hero">
+      <div class="badge">Queue Monitor → Entity Extraction</div>
+      <h1>Мониторинг очереди и обработки</h1>
+      <p class="lede">Показывает очередь задач, активную обработку и прогресс извлечения сущностей по чанкам.</p>
+      <div class="hero-meta">
+        <span class="pill">Источник: <code>/api/monitor/summary</code></span>
+        <span class="pill">Автообновление каждые 3 секунды</span>
+        <span class="pill">Детали задач: <code>/api/jobs/{job_id}</code></span>
+      </div>
+    </header>
+
+    <main class="monitor-layout">
+      <section class="panel monitor-primary">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Active Job</p>
+            <h2>Текущая задача</h2>
+          </div>
+          <span class="tag" id="model-id">model: -</span>
+        </div>
+
+        <div id="active-job" class="empty-state">
+          <p>Сейчас нет задач в обработке.</p>
+        </div>
+      </section>
+
+      <section class="monitor-stats">
+        <article class="panel stat-card">
+          <p class="eyebrow">Queued</p>
+          <strong id="stat-queued">0</strong>
+          <span id="stat-queued-age" class="muted">ожидание: -</span>
+        </article>
+        <article class="panel stat-card">
+          <p class="eyebrow">Running</p>
+          <strong id="stat-running">0</strong>
+          <span id="stat-running-age" class="muted">в работе: -</span>
+        </article>
+        <article class="panel stat-card">
+          <p class="eyebrow">Done</p>
+          <strong id="stat-done">0</strong>
+          <span id="stat-avg" class="muted">среднее: -</span>
+        </article>
+        <article class="panel stat-card">
+          <p class="eyebrow">Error</p>
+          <strong id="stat-error">0</strong>
+          <span id="last-update" class="muted">обновление: -</span>
+        </article>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Queue</p>
+            <h2>Очередь</h2>
+          </div>
+          <span class="tag" id="queue-count">0 задач</span>
+        </div>
+        <div id="queue-list" class="monitor-list empty-state">
+          <p>Очередь пуста.</p>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Done</p>
+            <h2>Недавно завершённые</h2>
+          </div>
+          <span class="tag" id="done-count">0 задач</span>
+        </div>
+        <div id="done-list" class="monitor-list empty-state">
+          <p>Завершённых задач пока нет.</p>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Errors</p>
+            <h2>Ошибки</h2>
+          </div>
+          <span class="tag" id="error-count">0 задач</span>
+        </div>
+        <div id="error-list" class="monitor-list empty-state">
+          <p>Ошибок пока нет.</p>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const activeJob = document.getElementById('active-job');
+    const queueList = document.getElementById('queue-list');
+    const doneList = document.getElementById('done-list');
+    const errorList = document.getElementById('error-list');
+    const modelId = document.getElementById('model-id');
+    const queueCount = document.getElementById('queue-count');
+    const doneCount = document.getElementById('done-count');
+    const errorCount = document.getElementById('error-count');
+    const lastUpdate = document.getElementById('last-update');
+
+    function fmtSec(value) {
+      if (typeof value !== 'number' || Number.isNaN(value)) return '-';
+      if (value < 60) return `${Math.round(value)} c`;
+      const min = Math.floor(value / 60);
+      const sec = Math.round(value % 60);
+      return `${min}м ${sec}с`;
+    }
+
+    function fmtTs(value) {
+      if (!value) return '-';
+      const dt = new Date(value);
+      if (Number.isNaN(dt.getTime())) return value;
+      return dt.toLocaleString('ru-RU');
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
+    function renderProgress(progress) {
+      if (!progress || (!progress.stage && !progress.message)) {
+        return '<p class="muted">Детальный прогресс пока недоступен.</p>';
+      }
+      const percent = typeof progress.progress_percent === 'number' ? progress.progress_percent : 0;
+      const chunkText = progress.chunk_count
+        ? `${progress.chunks_completed || 0}/${progress.chunk_count} чанков`
+        : 'этап без чанков';
+      return `
+        <div class="progress-block">
+          <div class="progress-meta">
+            <strong>${escapeHtml(progress.message || progress.stage || 'Обработка')}</strong>
+            <span>${percent}%</span>
+          </div>
+          <div class="progress-bar"><span style="width:${percent}%"></span></div>
+          <div class="progress-foot">
+            <span>stage: <code>${escapeHtml(progress.stage || '-')}</code></span>
+            <span>${escapeHtml(chunkText)}</span>
+            <span>ошибок чанков: ${escapeHtml(progress.failed_chunks ?? 0)}</span>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderActiveJob(job) {
+      if (!job) {
+        activeJob.className = 'empty-state';
+        activeJob.innerHTML = '<p>Сейчас нет задач в обработке.</p>';
+        return;
+      }
+      const progress = job.progress || {};
+      activeJob.className = 'job-card active-card';
+      activeJob.innerHTML = `
+        <div class="job-card-head">
+          <div>
+            <strong>${escapeHtml(job.filename || 'Без имени')}</strong>
+            <p class="muted mono">${escapeHtml(job.job_id)}</p>
+          </div>
+          <span class="tag status-running">running</span>
+        </div>
+        ${renderProgress(progress)}
+        <div class="job-grid">
+          <span>Запущена: ${escapeHtml(fmtTs(job.started_at))}</span>
+          <span>В работе: ${escapeHtml(fmtSec(job.processing_sec))}</span>
+          <span>Создана: ${escapeHtml(fmtTs(job.created_at))}</span>
+          <span>Модель: ${escapeHtml((job.meta && job.meta.model_id) || '-')}</span>
+        </div>
+      `;
+    }
+
+    function renderList(container, items, emptyText, type) {
+      if (!items || !items.length) {
+        container.className = 'monitor-list empty-state';
+        container.innerHTML = `<p>${escapeHtml(emptyText)}</p>`;
+        return;
+      }
+
+      container.className = 'monitor-list';
+      container.innerHTML = items.map((item) => {
+        const progress = item.progress || {};
+        const metaBits = [];
+        if (type === 'queue') metaBits.push(`позиция: ${item.queue_position}`);
+        if (typeof item.wait_sec === 'number') metaBits.push(`ожидание: ${fmtSec(item.wait_sec)}`);
+        if (typeof item.processing_sec === 'number') metaBits.push(`обработка: ${fmtSec(item.processing_sec)}`);
+        if (item.finished_at) metaBits.push(`завершена: ${fmtTs(item.finished_at)}`);
+        if (item.started_at && type !== 'done') metaBits.push(`старт: ${fmtTs(item.started_at)}`);
+
+        const extra = type === 'error'
+          ? `<pre class="error-preview">${escapeHtml(item.error_preview || item.error || '')}</pre>`
+          : '';
+
+        return `
+          <article class="job-card">
+            <div class="job-card-head">
+              <div>
+                <strong>${escapeHtml(item.filename || 'Без имени')}</strong>
+                <p class="muted mono">${escapeHtml(item.job_id)}</p>
+              </div>
+              <span class="tag">${escapeHtml(item.status || type)}</span>
+            </div>
+            <p class="job-card-meta">${metaBits.map(escapeHtml).join(' · ')}</p>
+            ${renderProgress(progress)}
+            ${extra}
+          </article>
+        `;
+      }).join('');
+    }
+
+    async function refresh() {
+      try {
+        const res = await fetch('/api/monitor/summary?limit=20');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const stats = data.stats || {};
+
+        document.getElementById('stat-queued').textContent = stats.queued ?? 0;
+        document.getElementById('stat-running').textContent = stats.running ?? 0;
+        document.getElementById('stat-done').textContent = stats.done ?? 0;
+        document.getElementById('stat-error').textContent = stats.error ?? 0;
+        document.getElementById('stat-queued-age').textContent = `ожидание: ${fmtSec(stats.oldest_queued_age_sec)}`;
+        document.getElementById('stat-running-age').textContent = `в работе: ${fmtSec(stats.oldest_running_age_sec)}`;
+        document.getElementById('stat-avg').textContent = `среднее: ${fmtSec(data.avg_processing_sec_recent)}`;
+        lastUpdate.textContent = `обновление: ${new Date().toLocaleTimeString('ru-RU')}`;
+
+        modelId.textContent = `model: ${data.model_id || '-'}`;
+        queueCount.textContent = `${(data.queue_preview || []).length} задач`;
+        doneCount.textContent = `${(data.recent_done || []).length} задач`;
+        errorCount.textContent = `${(data.recent_error || []).length} задач`;
+
+        renderActiveJob(data.active_job);
+        renderList(queueList, data.queue_preview, 'Очередь пуста.', 'queue');
+        renderList(doneList, data.recent_done, 'Завершённых задач пока нет.', 'done');
+        renderList(errorList, data.recent_error, 'Ошибок пока нет.', 'error');
+      } catch (err) {
+        activeJob.className = 'empty-state';
+        activeJob.innerHTML = `<p>Не удалось обновить монитор: ${escapeHtml(err.message || err)}</p>`;
+      }
+    }
+
+    refresh();
+    setInterval(refresh, 3000);
+  </script>
+</body>
+</html>

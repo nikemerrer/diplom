@@ -1,4 +1,3 @@
-# можно без version:, Docker Desktop поймёт спецификацию
 x-ollama-model: &ollama_model ${MODEL_ID:-qwen2.5:1.5b}
 
 services:
@@ -11,10 +10,9 @@ services:
       - ollama-data:/root/.ollama
     environment:
       MODEL_ID: *ollama_model
-      # не обязательно, но не мешает
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
-    gpus: all            # <<< ВАЖНО: заменяет device_requests
+    gpus: all
     restart: unless-stopped
 
   app:
@@ -26,9 +24,15 @@ services:
       OLLAMA_URL: http://ollama:11434
       OLLAMA_MODEL_ID: *ollama_model
       TEMPERATURE: 0.0
-      OLLAMA_NUM_PREDICT: -1
-      OLLAMA_TIMEOUT: 300
-      OLLAMA_NUM_CTX: 32768
+      OLLAMA_TIMEOUT: 120
+      OLLAMA_NUM_CTX: 4096
+      OLLAMA_NUM_PREDICT_CHUNK: 420
+      OLLAMA_NUM_PREDICT_VERIFY: 520
+      CHUNK_SIZE: 2200
+      CHUNK_OVERLAP: 320
+      HEADER_FOCUS_CHARS: 2600
+      MAX_CHUNKS: 10
+      VERIFY_ENABLED: 1
     ports:
       - "8000:8000"
     depends_on:

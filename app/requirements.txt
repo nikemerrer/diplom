@@ -2,7 +2,6 @@ fastapi
 uvicorn[standard]
 jinja2
 python-multipart
-pdfminer.six
 python-docx
 pdfminer.six
 PyPDF2
@@ -11,10 +10,3 @@ pdf2image
 pytesseract
 Pillow
 requests
-typing
-python-docx
-PyPDF2
-pdfminer.six
-pdf2image
-pytesseract
-striprtf

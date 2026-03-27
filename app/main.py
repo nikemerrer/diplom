@@ -8,6 +8,7 @@ import os
 import sqlite3
 import threading
 import time
+import traceback
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -71,6 +72,23 @@ def init_db() -> None:
     conn.close()
 
 
+def recover_stuck_jobs() -> None:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE jobs
+           SET status='error',
+               finished_at=?,
+               error_text=?
+         WHERE status='running'
+        """,
+        (now(), "Задача была прервана перезапуском сервиса или зависла."),
+    )
+    conn.commit()
+    conn.close()
+
+
 class CreateJob(BaseModel):
     filename: str
     content_base64: str
@@ -82,6 +100,8 @@ class GetResult(BaseModel):
 
 
 stop_event = threading.Event()
+runtime_lock = threading.Lock()
+runtime_jobs: Dict[str, Dict[str, Any]] = {}
 
 
 def now() -> str:
@@ -139,18 +159,102 @@ def render_json_payload(payload: Dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
-def process_file_bytes(file_bytes: bytes, filename: str = "") -> Dict[str, Any]:
+def update_runtime_job(job_id: str, **changes: Any) -> Dict[str, Any]:
+    snapshot: Dict[str, Any]
+    with runtime_lock:
+        current = dict(runtime_jobs.get(job_id, {}))
+        current.update(changes)
+        current["updated_at"] = now()
+        runtime_jobs[job_id] = current
+        snapshot = dict(current)
+    return snapshot
+
+
+def clear_runtime_job(job_id: str) -> None:
+    with runtime_lock:
+        runtime_jobs.pop(job_id, None)
+
+
+def get_runtime_job(job_id: str) -> Dict[str, Any]:
+    with runtime_lock:
+        current = runtime_jobs.get(job_id, {})
+        return dict(current) if current else {}
+
+
+def build_runtime_progress(job_id: str) -> Dict[str, Any]:
+    state = get_runtime_job(job_id)
+    if not state:
+        return {}
+
+    chunk_count = state.get("chunk_count")
+    chunks_completed = state.get("chunks_completed")
+    progress_percent = state.get("progress_percent")
+    if isinstance(chunk_count, int) and chunk_count > 0 and isinstance(chunks_completed, int):
+        progress_percent = max(0, min(100, round(chunks_completed / chunk_count * 100)))
+
+    return {
+        "stage": state.get("stage"),
+        "message": state.get("message"),
+        "updated_at": state.get("updated_at"),
+        "started_at": state.get("started_at"),
+        "text_length": state.get("text_length"),
+        "chunk_count": chunk_count,
+        "chunk_index": state.get("chunk_index"),
+        "chunk_length": state.get("chunk_length"),
+        "chunks_completed": chunks_completed,
+        "failed_chunks": state.get("failed_chunks"),
+        "chunk_ok": state.get("chunk_ok"),
+        "verify_enabled": state.get("verify_enabled"),
+        "progress_percent": progress_percent,
+    }
+
+
+def process_file_bytes(
+    file_bytes: bytes, filename: str = "", job_id: Optional[str] = None
+) -> Dict[str, Any]:
     from utils import file_reader
     from utils.entity_extractor import extract_onec_fields
 
+    if job_id:
+        update_runtime_job(
+            job_id,
+            stage="read_file",
+            message="Чтение и распознавание текста документа",
+            filename=filename,
+            started_at=now(),
+        )
+    print(f"[READ] filename={filename} bytes={len(file_bytes)}")
     text = file_reader.read_file_to_text(file_bytes=file_bytes, filename=filename)
+    print(f"[READ] extracted_text_len={len(text or '')}")
+    print(f"[READ] preview={repr((text or '')[:700])}")
+
     if not text or not text.strip():
         raise RuntimeError("Не удалось извлечь текст из файла")
 
-    result = extract_onec_fields(text)
+    if job_id:
+        update_runtime_job(
+            job_id,
+            stage="prepare_extract",
+            message="Текст извлечен, запускаем анализ сущностей",
+            text_length=len(text or ""),
+        )
+
+    def on_progress(payload: Dict[str, Any]) -> None:
+        if not job_id:
+            return
+        update_runtime_job(job_id, **payload)
+
+    result = extract_onec_fields(text, progress_callback=on_progress)
     if not isinstance(result, dict):
         raise RuntimeError("extract_onec_fields вернул некорректный результат")
 
+    if job_id:
+        update_runtime_job(
+            job_id,
+            stage="done",
+            message="Извлечение сущностей завершено",
+            progress_percent=100,
+        )
     return result
 
 
@@ -202,6 +306,13 @@ def worker() -> None:
             (now(), job_id),
         )
         conn.commit()
+        update_runtime_job(
+            job_id,
+            stage="queued_to_running",
+            message="Задача взята воркером в обработку",
+            filename=None,
+            started_at=now(),
+        )
 
         try:
             cur.execute(
@@ -217,15 +328,32 @@ def worker() -> None:
             if not payload:
                 raise RuntimeError(f"Payload для job_id={job_id} не найден")
 
-            result = process_file_bytes(payload["file_bytes"], payload["filename"] or "")
+            result = process_file_bytes(
+                payload["file_bytes"], payload["filename"] or "", job_id=job_id
+            )
             cur.execute(
                 "UPDATE jobs SET status='done', finished_at=?, result_json=? WHERE job_id=?",
                 (now(), json.dumps(result, ensure_ascii=False), job_id),
             )
-        except Exception as exc:
+            update_runtime_job(
+                job_id,
+                stage="done",
+                message="Результат записан в базу",
+                finished_at=now(),
+            )
+        except Exception:
+            err = traceback.format_exc()
+            print(f"[JOB][ERROR] job_id={job_id}\n{err}")
             cur.execute(
                 "UPDATE jobs SET status='error', finished_at=?, error_text=? WHERE job_id=?",
-                (now(), str(exc), job_id),
+                (now(), err[-4000:], job_id),
+            )
+            update_runtime_job(
+                job_id,
+                stage="error",
+                message="Ошибка при обработке задачи",
+                error=trim_text(err[-4000:], 500),
+                finished_at=now(),
             )
 
         conn.commit()
@@ -338,6 +466,13 @@ def create_job(req: CreateJob):
     cur.execute("INSERT INTO payloads VALUES (?, ?)", (job_id, sqlite3.Binary(file_bytes)))
     conn.commit()
     conn.close()
+    update_runtime_job(
+        job_id,
+        stage="queued",
+        message="Задача поставлена в очередь",
+        filename=req.filename,
+        created_at=now(),
+    )
     return {"job_id": job_id, "status": "queued"}
 
 
@@ -357,6 +492,7 @@ def get_result(req: GetResult) -> Response:
         "status": row["status"],
         "result": json.loads(row["result_json"]) if row["result_json"] else None,
         "error": row["error_text"],
+        "progress": build_runtime_progress(row["job_id"]),
     }
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     return Response(
@@ -410,6 +546,7 @@ def get_job_detail(job_id: str) -> Dict[str, Any]:
         "filename": row["filename"],
         "result": json.loads(row["result_json"]) if row["result_json"] else None,
         "error": row["error_text"],
+        "progress": build_runtime_progress(row["job_id"]),
     }
 
 
@@ -478,6 +615,7 @@ def monitor_summary(limit: int = 120) -> Dict[str, Any]:
             "started_at": row["started_at"],
             "processing_sec": seconds_since(row["started_at"]),
             "meta": extract_result_meta(row["result_json"]),
+            "progress": build_runtime_progress(row["job_id"]),
         }
         for row in running_rows
     ]
@@ -489,6 +627,7 @@ def monitor_summary(limit: int = 120) -> Dict[str, Any]:
             "created_at": row["created_at"],
             "wait_sec": seconds_since(row["created_at"]),
             "queue_position": index + 1,
+            "progress": build_runtime_progress(row["job_id"]),
         }
         for index, row in enumerate(queue_rows)
     ]
@@ -503,6 +642,7 @@ def monitor_summary(limit: int = 120) -> Dict[str, Any]:
             "wait_sec": seconds_between(row["created_at"], row["started_at"]),
             "processing_sec": seconds_between(row["started_at"], row["finished_at"]),
             "meta": extract_result_meta(row["result_json"]),
+            "progress": build_runtime_progress(row["job_id"]),
         }
         for row in done_rows
     ]
@@ -516,6 +656,7 @@ def monitor_summary(limit: int = 120) -> Dict[str, Any]:
             "finished_at": row["finished_at"],
             "error": row["error_text"],
             "error_preview": trim_text(row["error_text"]),
+            "progress": build_runtime_progress(row["job_id"]),
         }
         for row in error_rows
     ]
@@ -549,6 +690,7 @@ def monitor_page(request: Request) -> HTMLResponse:
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    recover_stuck_jobs()
     stop_event.clear()
     threading.Thread(target=worker, daemon=True).start()
 
